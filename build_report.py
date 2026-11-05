@@ -55,25 +55,65 @@ def norm(s: str) -> str:
     return re.sub(r"\s+", " ", s.lower()).strip()
 
 
+# Modelos a probar en orden. Google retira/renombra modelos seguido: si uno da 404,
+# se prueba el siguiente. Podés forzar uno con la variable GEMINI_MODEL.
+MODEL_CANDIDATES = [
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-3.6-flash",
+    "gemini-3.8-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-flash",
+]
+API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+
+
+def list_available_models(key: str) -> list[str]:
+    try:
+        r = requests.get(f"{API_BASE}/models", headers={"x-goog-api-key": key}, params={"pageSize": 200}, timeout=30)
+        r.raise_for_status()
+        return [
+            m["name"].split("/")[-1]
+            for m in r.json().get("models", [])
+            if "generateContent" in m.get("supportedGenerationMethods", [])
+        ]
+    except Exception as e:  # noqa: BLE001
+        return [f"(no se pudo listar modelos: {e})"]
+
+
 def call_gemini(prompt: str) -> dict:
     key = os.environ["GEMINI_API_KEY"]
-    model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    forced = os.environ.get("GEMINI_MODEL", "").strip()
+    candidates = [forced] if forced else MODEL_CANDIDATES
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0.1, "responseMimeType": "application/json"},
     }
-    last_err = None
-    for attempt in range(4):
-        r = requests.post(url, headers={"x-goog-api-key": key}, json=body, timeout=120)
-        if r.status_code in (429, 500, 503):
-            last_err = f"HTTP {r.status_code}: {r.text[:200]}"
-            time.sleep(15 * (attempt + 1))
+    errors = []
+    for model in candidates:
+        url = f"{API_BASE}/models/{model}:generateContent"
+        for attempt in range(3):
+            r = requests.post(url, headers={"x-goog-api-key": key}, json=body, timeout=120)
+            if r.status_code in (429, 500, 503):
+                errors.append(f"{model}: HTTP {r.status_code}")
+                time.sleep(15 * (attempt + 1))
+                continue
+            break
+        if r.status_code in (404, 400, 403, 429, 500, 503):
+            errors.append(f"{model}: HTTP {r.status_code} {r.text[:150]}")
+            print(f"Modelo {model} no disponible (HTTP {r.status_code}), pruebo el siguiente...", file=sys.stderr)
             continue
         r.raise_for_status()
+        print(f"Modelo usado: {model}", file=sys.stderr)
         text = r.json()["candidates"][0]["content"]["parts"][0]["text"]
         return json.loads(text)
-    raise RuntimeError(f"Gemini no respondió tras varios intentos ({last_err})")
+
+    disponibles = ", ".join(list_available_models(key))
+    raise RuntimeError(
+        "Ningún modelo respondió.\nIntentos: " + " | ".join(errors) +
+        f"\nModelos disponibles para tu clave: {disponibles}\n"
+        "Definí uno de esa lista como variable GEMINI_MODEL."
+    )
 
 
 def extract_promos(raw: dict, now: datetime) -> list[dict]:
